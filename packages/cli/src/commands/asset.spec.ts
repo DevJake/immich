@@ -20,6 +20,7 @@ import {
   findSidecar,
   getAlbumName,
   startWatch,
+  uploadBatch,
   uploadFiles,
   UploadOptionsDto,
 } from 'src/commands/asset';
@@ -286,6 +287,86 @@ describe('checkForDuplicates', () => {
       newFiles: [],
       rejects: [],
     });
+  });
+});
+
+describe('uploadBatch', () => {
+  const baseUrl = 'https://example.com';
+  const fetchMocker = createFetchMock(vi);
+
+  let testDir: string;
+  let newFilePath: string;
+  let duplicateFilePath: string;
+
+  beforeEach(() => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'test-no-upload-'));
+    newFilePath = path.join(testDir, 'new.jpg');
+    duplicateFilePath = path.join(testDir, 'duplicate.jpg');
+    fs.writeFileSync(newFilePath, 'new');
+    fs.writeFileSync(duplicateFilePath, 'duplicate');
+
+    vi.mocked(defaults).baseUrl = baseUrl;
+    vi.mocked(defaults).headers = { 'x-api-key': 'key' };
+
+    fetchMocker.enableMocks();
+    fetchMocker.resetMocks();
+    fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), function () {
+      return {
+        status: 201,
+        body: JSON.stringify({ id: 'fc5621b1-86f6-44a1-9905-403e607df9f5', status: 'created' }),
+      };
+    });
+
+    vi.mocked(checkBulkUpload).mockResolvedValue({
+      results: [
+        {
+          action: AssetUploadAction.Accept,
+          id: newFilePath,
+        },
+        {
+          action: AssetUploadAction.Reject,
+          id: duplicateFilePath,
+          assetId: '8b7f1a2c-0d3e-4f5a-9b6c-7d8e9f0a1b2c',
+          reason: AssetRejectReason.Duplicate,
+        },
+      ],
+    });
+  });
+
+  afterEach(() => {
+    fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('uploads new files by default', async () => {
+    await uploadBatch([newFilePath, duplicateFilePath], { concurrency: 1 });
+
+    expect(fetchMocker.mock.calls.length).toBe(1);
+    expect(fs.existsSync(newFilePath)).toBe(true);
+  });
+
+  it('uploads nothing when upload is disabled, but still deletes duplicates', async () => {
+    await uploadBatch([newFilePath, duplicateFilePath], {
+      concurrency: 1,
+      upload: false,
+      deleteDuplicates: true,
+    });
+
+    expect(fetchMocker.mock.calls.length).toBe(0);
+    expect(fs.existsSync(duplicateFilePath)).toBe(false);
+    expect(fs.existsSync(newFilePath)).toBe(true);
+  });
+
+  it('deletes nothing when upload is disabled alongside a dry run', async () => {
+    await uploadBatch([newFilePath, duplicateFilePath], {
+      concurrency: 1,
+      upload: false,
+      deleteDuplicates: true,
+      dryRun: true,
+    });
+
+    expect(fetchMocker.mock.calls.length).toBe(0);
+    expect(fs.existsSync(duplicateFilePath)).toBe(true);
+    expect(fs.existsSync(newFilePath)).toBe(true);
   });
 });
 

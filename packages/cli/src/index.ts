@@ -86,6 +86,12 @@ program
       'IMMICH_DELETE_DUPLICATES',
     ),
   )
+  .addOption(
+    new Option('--no-upload', 'Check files against the server without uploading them, e.g. to only prune duplicates')
+      .env('IMMICH_NO_UPLOAD')
+      .default(true)
+      .conflicts(['delete', 'skipHash']),
+  )
   .addOption(new Option('--no-progress', 'Hide progress bars').env('IMMICH_PROGRESS_BAR').default(true))
   .addOption(
     new Option('--watch', 'Watch for changes and upload automatically')
