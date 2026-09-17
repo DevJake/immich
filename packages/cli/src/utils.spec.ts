@@ -63,6 +63,57 @@ const tests: Test[] = [
     skipOnWin32: true, // single quote interferes with mockfs root on Windows
   },
   {
+    test: 'should crawl a folder with parentheses in its name',
+    options: {
+      pathsToCrawl: ['/Italy 2025 (April)/'],
+    },
+    files: {
+      '/Italy 2025 (April)/image.jpg': true,
+    },
+  },
+  {
+    test: 'should crawl a folder with braces and a comma in its name recursively',
+    options: {
+      pathsToCrawl: ['/Trip {a,b}/'],
+      recursive: true,
+    },
+    files: {
+      '/Trip {a,b}/image1.jpg': true,
+      '/Trip {a,b}/subfolder/image2.jpg': true,
+    },
+  },
+  {
+    test: 'should crawl a folder with both an apostrophe and parentheses in its name',
+    options: {
+      pathsToCrawl: ["/Jake's (trip)/"],
+    },
+    files: {
+      "/Jake's (trip)/image.jpg": true,
+    },
+    skipOnWin32: true, // single quote interferes with mockfs root on Windows
+  },
+  {
+    test: 'should not over-match a sibling folder when the crawled folder name contains an asterisk',
+    options: {
+      pathsToCrawl: ['/Star*dust/'],
+    },
+    files: {
+      '/Star*dust/image.jpg': true,
+      '/Stardust-other/image.jpg': false,
+    },
+  },
+  {
+    test: 'should still treat a user-supplied glob pattern as a pattern when the literal path does not exist',
+    options: {
+      pathsToCrawl: ['/trip*'],
+    },
+    files: {
+      '/trip1/image.jpg': true,
+      '/trip2/image.jpg': true,
+      '/nontrip/image.jpg': false,
+    },
+  },
+  {
     test: 'should crawl a single file',
     options: {
       pathsToCrawl: ['/photos/image.jpg'],

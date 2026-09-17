@@ -7,7 +7,7 @@ import {
   isMalformedResponseError,
   Permission,
 } from '@immich/sdk';
-import { convertPathToPattern, glob } from 'fast-glob';
+import { convertPathToPattern, escapePath, glob } from 'fast-glob';
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { readFile, stat, writeFile } from 'node:fs/promises';
@@ -157,6 +157,18 @@ const convertPathToPatternOnWin = (path: string) => {
   return platform() === 'win32' ? convertPathToPattern(path) : path;
 };
 
+// Escapes glob metacharacters (e.g. `(`, `)`, `{`, `}`, `*`, `?`) in a literal directory
+// path so that names such as `Italy 2025 (April)` or `Trip {a,b}` are matched as literal
+// text rather than interpreted as glob syntax. This must only be used for paths that are
+// known to exist on disk (i.e. resolved via `stat`), never for user-supplied glob patterns.
+//
+// Skipped on win32: `convertPathToPatternOnWin` already escapes via fast-glob's
+// Windows-specific `convertPathToPattern`, which performs its own escaping internally.
+// Escaping here as well would double-escape the path.
+const escapeDirectoryPath = (path: string) => {
+  return platform() === 'win32' ? path : escapePath(path);
+};
+
 export const crawl = async (options: CrawlOptions): Promise<string[]> => {
   const { extensions: extensionsWithPeriod, recursive, pathsToCrawl, exclusionPattern, includeHidden } = options;
   const extensions = extensionsWithPeriod.map((extension) => extension.replace('.', ''));
@@ -175,7 +187,7 @@ export const crawl = async (options: CrawlOptions): Promise<string[]> => {
       if (stats.isFile() || stats.isSymbolicLink()) {
         crawledFiles.push(absolutePath);
       } else {
-        patterns.push(convertPathToPatternOnWin(absolutePath));
+        patterns.push(convertPathToPatternOnWin(escapeDirectoryPath(absolutePath)));
       }
     } catch (error: any) {
       if (error.code === 'ENOENT') {
