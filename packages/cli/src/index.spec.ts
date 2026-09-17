@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from 'vitest';
+import { upload } from 'src/commands/asset';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@immich/sdk');
 vi.mock('src/commands/asset');
@@ -59,5 +60,35 @@ describe('upload command arguments', () => {
     const { stderr } = await parseArgs(['upload', '--no-upload', '--dry-run', '/tmp']);
 
     expect(stderr).not.toContain('cannot be used with');
+  });
+});
+
+const uploadOptions = () => vi.mocked(upload).mock.calls.at(-1)?.[2];
+
+describe('hash cache options', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.mocked(upload).mockClear();
+  });
+
+  it('enables the cache by default', async () => {
+    await parseArgs(['upload', '/tmp']);
+
+    expect(uploadOptions()).toMatchObject({ cache: true });
+  });
+
+  it('disables the cache with --no-cache', async () => {
+    await parseArgs(['upload', '--no-cache', '/tmp']);
+
+    expect(uploadOptions()).toMatchObject({ cache: false });
+  });
+
+  it('disables the cache when IMMICH_NO_CACHE is merely present', async () => {
+    // Commander turns a boolean option on when its environment variable exists at all, whatever
+    // the value. The variable is therefore named after the flag, not after the thing it disables.
+    vi.stubEnv('IMMICH_NO_CACHE', '');
+    await parseArgs(['upload', '/tmp']);
+
+    expect(uploadOptions()).toMatchObject({ cache: false });
   });
 });

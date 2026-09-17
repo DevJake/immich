@@ -6,6 +6,7 @@ import path from 'node:path';
 import { upload } from 'src/commands/asset.js';
 import { login, logout } from 'src/commands/auth.js';
 import { serverInfo } from 'src/commands/server-info.js';
+import { clearHashCache, getCacheDirectory } from 'src/hash-cache.js';
 import { version } from '../package.json';
 
 const defaultConfigDirectory = path.join(os.homedir(), '.config/immich/');
@@ -35,6 +36,15 @@ program
   .command('logout')
   .description('Remove stored credentials')
   .action(() => logout(program.opts()));
+
+program
+  .command('clear-cache')
+  .description('Delete the persistent hash cache')
+  .action(() => {
+    const directory = getCacheDirectory();
+    const removed = clearHashCache(directory);
+    console.log(removed > 0 ? `Deleted the hash cache in ${directory}` : 'No hash cache to delete');
+  });
 
 program
   .command('server-info')
@@ -91,6 +101,13 @@ program
       .env('IMMICH_NO_UPLOAD')
       .default(true)
       .conflicts(['delete', 'skipHash']),
+  )
+  .addOption(
+    // Named after the flag, not the negated noun: commander enables a boolean option on the mere
+    // presence of its environment variable, so IMMICH_NO_CACHE=anything must mean "do not cache".
+    new Option('--no-cache', 'Hash every file from disk, ignoring the persistent hash cache')
+      .env('IMMICH_NO_CACHE')
+      .default(true),
   )
   .addOption(new Option('--no-progress', 'Hide progress bars').env('IMMICH_PROGRESS_BAR').default(true))
   .addOption(

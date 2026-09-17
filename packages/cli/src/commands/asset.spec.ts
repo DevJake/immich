@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { describe, expect, it, MockedFunction, vi } from 'vitest';
+import { describe, expect, it, MockedFunction, MockInstance, vi } from 'vitest';
 
 import {
   AssetRejectReason,
@@ -16,6 +16,7 @@ import createFetchMock from 'vitest-fetch-mock';
 
 import {
   checkForDuplicates,
+  closeHashCache,
   deleteFiles,
   findSidecar,
   getAlbumName,
@@ -32,6 +33,23 @@ vi.mock('src/utils', async (importOriginal) => ({
   authenticate: vi.fn(),
   requirePermissions: vi.fn(),
 }));
+
+// Every test gets a throwaway hash cache. Without this the suite would read and write the real
+// cache in the developer's home directory.
+const hashCacheHome = { directory: '' };
+const cacheFilePath = () => path.join(hashCacheHome.directory, 'immich', 'hash-cache.jsonl');
+
+beforeEach(() => {
+  hashCacheHome.directory = fs.mkdtempSync(path.join(os.tmpdir(), 'immich-hash-cache-'));
+  vi.stubEnv('XDG_CACHE_HOME', hashCacheHome.directory);
+  closeHashCache();
+});
+
+afterEach(() => {
+  closeHashCache();
+  vi.unstubAllEnvs();
+  fs.rmSync(hashCacheHome.directory, { recursive: true, force: true });
+});
 
 describe('getAlbumName', () => {
   it('should return a non-undefined value', () => {
@@ -191,6 +209,8 @@ describe('checkForDuplicates', () => {
         {
           filepath: testFilePath,
           id: 'fc5621b1-86f6-44a1-9905-403e607df9f5',
+          checksum: testFileChecksum,
+          fromCache: false,
         },
       ],
       newFiles: [],
@@ -607,5 +627,131 @@ describe('deleteFiles', () => {
 
     expect(fs.existsSync(testFilePath)).toBe(true);
     expect(fs.existsSync(sidecarPath)).toBe(true);
+  });
+});
+
+describe('hash cache integration', () => {
+  // A whole number of seconds, so that mtime_ns can be restored exactly — the `touch -r` case that
+  // makes a stale cache hit possible in the first place.
+  const fixedTime = 1_700_000_000;
+  const assetId = 'fc5621b1-86f6-44a1-9905-403e607df9f5';
+
+  let testDir: string;
+  let duplicatePath: string;
+  let logSpy: MockInstance<typeof console.log>;
+
+  const logged = () => logSpy.mock.calls.map((call) => call.join(' ')).join('\n');
+
+  beforeEach(() => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'immich-cache-test-'));
+    duplicatePath = path.join(testDir, 'duplicate.jpg');
+    fs.writeFileSync(duplicatePath, 'duplicate');
+    fs.utimesSync(duplicatePath, fixedTime, fixedTime);
+
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    vi.mocked(checkBulkUpload).mockResolvedValue({
+      results: [{ action: AssetUploadAction.Reject, id: duplicatePath, assetId, reason: AssetRejectReason.Duplicate }],
+    });
+  });
+
+  afterEach(() => {
+    logSpy.mockRestore();
+    fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('hashes on the first run and reuses the checksum on the next', async () => {
+    const first = await checkForDuplicates([duplicatePath], { concurrency: 1 });
+    expect(first.duplicates[0].fromCache).toBe(false);
+    expect(logged()).toContain('Hash cache: 0/1 file reused');
+
+    // Close and reopen so the second run genuinely reads the checksum back off disk.
+    closeHashCache();
+    logSpy.mockClear();
+
+    const second = await checkForDuplicates([duplicatePath], { concurrency: 1 });
+    expect(second.duplicates[0].fromCache).toBe(true);
+    expect(second.duplicates[0].checksum).toBe(first.duplicates[0].checksum);
+    expect(logged()).toContain('Hash cache: 1/1 file reused');
+  });
+
+  it('deletes a cached duplicate whose contents really are unchanged', async () => {
+    await checkForDuplicates([duplicatePath], { concurrency: 1 });
+    closeHashCache();
+
+    const { duplicates } = await checkForDuplicates([duplicatePath], { concurrency: 1 });
+    expect(duplicates[0].fromCache).toBe(true);
+
+    await deleteFiles([], duplicates, { deleteDuplicates: true, concurrency: 1 });
+
+    expect(fs.existsSync(duplicatePath)).toBe(false);
+  });
+
+  it('refuses to delete a duplicate whose cached checksum has gone stale', async () => {
+    await checkForDuplicates([duplicatePath], { concurrency: 1 });
+    closeHashCache();
+
+    // The hazard in full: the contents change, but size, inode and nanosecond mtime are all put
+    // back, exactly as `touch -r`, `rsync --times` or a restore tool would leave them.
+    const before = fs.statSync(duplicatePath, { bigint: true });
+    fs.writeFileSync(duplicatePath, 'DUPLICATE');
+    fs.utimesSync(duplicatePath, fixedTime, fixedTime);
+    const after = fs.statSync(duplicatePath, { bigint: true });
+    expect(after.size).toBe(before.size);
+    expect(after.ino).toBe(before.ino);
+    expect(after.mtimeNs).toBe(before.mtimeNs);
+
+    const { duplicates } = await checkForDuplicates([duplicatePath], { concurrency: 1 });
+    expect(duplicates[0].fromCache).toBe(true);
+
+    await deleteFiles([], duplicates, { deleteDuplicates: true, concurrency: 1 });
+
+    expect(fs.existsSync(duplicatePath)).toBe(true);
+    expect(fs.readFileSync(duplicatePath, 'utf8')).toBe('DUPLICATE');
+    expect(logged()).toContain('WARNING: the hash cache was stale for 1 file, which will NOT be deleted');
+    expect(logged()).toContain(duplicatePath);
+  });
+
+  it('records the corrected checksum so the next run is not stale twice', async () => {
+    await checkForDuplicates([duplicatePath], { concurrency: 1 });
+    closeHashCache();
+
+    fs.writeFileSync(duplicatePath, 'DUPLICATE');
+    fs.utimesSync(duplicatePath, fixedTime, fixedTime);
+
+    const stale = await checkForDuplicates([duplicatePath], { concurrency: 1 });
+    await deleteFiles([], stale.duplicates, { deleteDuplicates: true, concurrency: 1 });
+    closeHashCache();
+
+    const corrected = await checkForDuplicates([duplicatePath], { concurrency: 1 });
+    expect(corrected.duplicates[0].fromCache).toBe(true);
+    expect(corrected.duplicates[0].checksum).not.toBe(stale.duplicates[0].checksum);
+
+    await deleteFiles([], corrected.duplicates, { deleteDuplicates: true, concurrency: 1 });
+    expect(fs.existsSync(duplicatePath)).toBe(false);
+  });
+
+  it('bypasses the cache entirely with --no-cache', async () => {
+    const first = await checkForDuplicates([duplicatePath], { concurrency: 1, cache: false });
+    closeHashCache();
+    const second = await checkForDuplicates([duplicatePath], { concurrency: 1, cache: false });
+
+    expect(first.duplicates[0].fromCache).toBe(false);
+    expect(second.duplicates[0].fromCache).toBe(false);
+    expect(fs.existsSync(cacheFilePath())).toBe(false);
+    expect(logged()).not.toContain('Hash cache:');
+  });
+
+  it('does not re-hash before deleting when nothing will be deleted', async () => {
+    await checkForDuplicates([duplicatePath], { concurrency: 1 });
+    closeHashCache();
+
+    const { duplicates } = await checkForDuplicates([duplicatePath], { concurrency: 1 });
+    fs.rmSync(duplicatePath);
+
+    // A missing file would be reported by the guard; without --delete-duplicates it never runs.
+    await deleteFiles([], duplicates, { concurrency: 1 });
+
+    expect(logged()).not.toContain('WARNING');
   });
 });

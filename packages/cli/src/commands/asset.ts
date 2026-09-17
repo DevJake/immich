@@ -19,9 +19,10 @@ import { Matcher, watch as watchFs } from 'chokidar';
 import { MultiBar, Presets, SingleBar } from 'cli-progress';
 import { chunk } from 'lodash-es';
 import micromatch from 'micromatch';
-import { Stats, createReadStream, existsSync } from 'node:fs';
+import { BigIntStats, Stats, createReadStream, existsSync } from 'node:fs';
 import { stat, unlink } from 'node:fs/promises';
 import path, { basename } from 'node:path';
+import { HashCache } from 'src/hash-cache.js';
 import { Queue } from 'src/queue.js';
 import { BaseOptions, Batcher, authenticate, crawl, requirePermissions, s, sha1 } from 'src/utils.js';
 
@@ -30,7 +31,14 @@ const UPLOAD_WATCH_DEBOUNCE_TIME_MS = 10_000;
 
 // TODO figure out why `id` is missing
 type AssetBulkUploadCheckResults = Array<AssetBulkUploadCheckResult & { id: string }>;
-type Asset = { id: string; filepath: string };
+type Asset = {
+  id: string;
+  filepath: string;
+  /** The checksum sent to the server for this file, when one was computed. */
+  checksum?: string;
+  /** True when that checksum came from the hash cache rather than from reading the file. */
+  fromCache?: boolean;
+};
 // A file the server refused for a reason other than "we already have it", so there is no
 // server-side copy and the local file must not be deleted.
 type RejectedFile = { filepath: string; reason?: AssetRejectReason };
@@ -52,7 +60,29 @@ export interface UploadOptionsDto {
   jsonOutput?: boolean;
   /** Set to false by `--no-upload` to check files against the server without uploading them. */
   upload?: boolean;
+  /** Set to false by `--no-cache` to hash every file from disk, ignoring the persistent cache. */
+  cache?: boolean;
 }
+
+// One cache per process: `--watch` calls checkForDuplicates once per batch, and re-reading the log
+// each time would undo the saving. Closed on exit, and by closeHashCache() between tests.
+const hashCacheSlot: { cache?: HashCache; isResolved: boolean } = { isResolved: false };
+
+const getHashCache = (options: UploadOptionsDto): HashCache | undefined => {
+  if (!hashCacheSlot.isResolved) {
+    hashCacheSlot.isResolved = true;
+    hashCacheSlot.cache = options.cache === false ? undefined : new HashCache();
+  }
+
+  return hashCacheSlot.cache;
+};
+
+/** Flushes and forgets the process-wide cache. */
+export const closeHashCache = () => {
+  hashCacheSlot.cache?.close();
+  hashCacheSlot.cache = undefined;
+  hashCacheSlot.isResolved = false;
+};
 
 class UploadFile extends File {
   constructor(
@@ -182,21 +212,26 @@ const scan = async (pathsToCrawl: string[], options: UploadOptionsDto) => {
   return files;
 };
 
-export const checkForDuplicates = async (files: string[], { concurrency, skipHash, progress }: UploadOptionsDto) => {
+export const checkForDuplicates = async (files: string[], options: UploadOptionsDto) => {
+  const { concurrency, skipHash, progress } = options;
   if (skipHash) {
     console.log('Skipping hash check, assuming all files are new');
     return { newFiles: files, duplicates: [], rejects: [] };
   }
 
+  const cache = getHashCache(options);
+
   let multiBar: MultiBar | undefined;
   let totalSize = 0;
-  const statsMap = new Map<string, Stats>();
+  // Stats are taken with bigint precision because the cache keys on nanosecond mtime, device and
+  // inode, none of which survive the default number-typed Stats intact.
+  const statsMap = new Map<string, BigIntStats>();
 
   // Calculate total size first
   for (const filepath of files) {
-    const stats = await stat(filepath);
+    const stats = await stat(filepath, { bigint: true });
     statsMap.set(filepath, stats);
-    totalSize += stats.size;
+    totalSize += Number(stats.size);
   }
 
   if (progress) {
@@ -236,6 +271,8 @@ export const checkForDuplicates = async (files: string[], { concurrency, skipHas
   const newFiles: string[] = [];
   const duplicates: Asset[] = [];
   const rejects: RejectedFile[] = [];
+  // Remembered so that a duplicate can be re-verified before it is unlinked.
+  const checksums = new Map<string, { checksum: string; fromCache: boolean }>();
 
   const checkBulkUploadQueue = new Queue<AssetBulkUploadCheckItem[], void>(
     async (assets: AssetBulkUploadCheckItem[]) => {
@@ -248,7 +285,7 @@ export const checkForDuplicates = async (files: string[], { concurrency, skipHas
           newFiles.push(filepath);
         } else if (reason === AssetRejectReason.Duplicate && assetId) {
           // only a confirmed duplicate with a known asset id is safe to delete locally
-          duplicates.push({ id: assetId, filepath });
+          duplicates.push({ id: assetId, filepath, ...checksums.get(filepath) });
         } else {
           // anything else (an unsupported format, or a reason this version does not know
           // about) has no copy on the server, so it is reported but never deleted
@@ -260,7 +297,7 @@ export const checkForDuplicates = async (files: string[], { concurrency, skipHas
       let processedSize = 0;
       for (const asset of assets) {
         const stats = statsMap.get(asset.id);
-        processedSize += stats?.size || 0;
+        processedSize += Number(stats?.size ?? 0);
       }
       checkProgressBar?.increment(processedSize);
     },
@@ -276,7 +313,14 @@ export const checkForDuplicates = async (files: string[], { concurrency, skipHas
       if (!stats) {
         throw new Error(`Stats not found for ${filepath}`);
       }
-      const dto = { id: filepath, checksum: await sha1(filepath) };
+      const cached = cache?.get(stats);
+      const checksum = cached ?? (await sha1(filepath));
+      if (!cached) {
+        cache?.set(stats, checksum);
+      }
+
+      const dto = { id: filepath, checksum };
+      checksums.set(filepath, { checksum, fromCache: cached !== undefined });
 
       results.push(dto);
       checkBulkUploadRequests.push(dto);
@@ -286,7 +330,7 @@ export const checkForDuplicates = async (files: string[], { concurrency, skipHas
         void checkBulkUploadQueue.push(batch);
       }
 
-      hashProgressBar?.increment(stats.size);
+      hashProgressBar?.increment(Number(stats.size));
       return results;
     },
     { concurrency, retry: 3 },
@@ -307,6 +351,13 @@ export const checkForDuplicates = async (files: string[], { concurrency, skipHas
   multiBar?.stop();
 
   console.log(`Found ${newFiles.length} new files and ${duplicates.length} duplicate${s(duplicates.length)}`);
+
+  if (cache && cache.hits + cache.misses > 0) {
+    const total = cache.hits + cache.misses;
+    console.log(
+      `Hash cache: ${cache.hits}/${total} file${s(total)} reused (${byteSize(cache.hitBytes)} not re-read), ${cache.misses} hashed`,
+    );
+  }
 
   if (rejects.length > 0) {
     console.log(
@@ -481,7 +532,73 @@ export const findSidecar = (filepath: string): string | undefined => {
   }
 };
 
+/**
+ * Re-hashes duplicates whose checksum came from the cache, immediately before they are unlinked,
+ * and drops any whose contents no longer match what was sent to the server.
+ *
+ * This is the safety net that makes the cache usable at all. A cached checksum is a claim that the
+ * server already holds these bytes; if the file changed without its size or nanosecond mtime
+ * changing — `touch -r`, `rsync --times`, a coarse-grained filesystem — acting on that claim
+ * unlinks the only copy of data the server has never seen, with no quarantine and no undo.
+ *
+ * It is cheap where it matters. On a re-run the duplicates have already been deleted, so what
+ * remains is mostly new files, which are never re-read here. Files hashed during this run are not
+ * re-read either: their checksum came from the very bytes about to be deleted.
+ */
+const verifyDuplicates = async (duplicates: Asset[], options: UploadOptionsDto): Promise<Asset[]> => {
+  const suspect = duplicates.filter((asset) => asset.fromCache && asset.checksum);
+  if (suspect.length === 0) {
+    return duplicates;
+  }
+
+  const cache = getHashCache(options);
+  const stale: Array<{ filepath: string; reason: string }> = [];
+
+  for (const batch of chunk(suspect, options.concurrency)) {
+    await Promise.all(
+      batch.map(async (asset: Asset) => {
+        try {
+          const stats = await stat(asset.filepath, { bigint: true });
+          const checksum = await sha1(asset.filepath);
+          if (checksum === asset.checksum) {
+            return;
+          }
+
+          // The cached entry was wrong. Replace it with the truth so the next run starts clean.
+          cache?.set(stats, checksum);
+          stale.push({ filepath: asset.filepath, reason: 'contents changed since it was hashed' });
+        } catch (error) {
+          stale.push({ filepath: asset.filepath, reason: `could not be re-read (${error})` });
+        }
+      }),
+    );
+  }
+
+  if (stale.length === 0) {
+    return duplicates;
+  }
+
+  const staleFiles = new Set(stale.map(({ filepath }) => filepath));
+  console.log(
+    `WARNING: the hash cache was stale for ${stale.length} file${s(stale.length)}, which will NOT be deleted:`,
+  );
+  for (const { filepath, reason } of stale) {
+    console.log(`- ${filepath} - ${reason}`);
+  }
+  console.log(
+    'The server does not hold the current contents of these files. Run the upload again to send them, and consider --no-cache if this keeps happening.',
+  );
+
+  return duplicates.filter((asset) => !staleFiles.has(asset.filepath));
+};
+
 export const deleteFiles = async (uploaded: Asset[], duplicates: Asset[], options: UploadOptionsDto): Promise<void> => {
+  if (options.deleteDuplicates && !options.dryRun) {
+    // Only worth doing when a stale hit would actually destroy something; without a delete flag
+    // the worst a stale hit can cost is an unnecessary upload.
+    duplicates = await verifyDuplicates(duplicates, options);
+  }
+
   let fileCount = 0;
   if (options.delete) {
     fileCount += uploaded.length;
