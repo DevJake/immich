@@ -50,6 +50,8 @@ export interface UploadOptionsDto {
   progress?: boolean;
   watch?: boolean;
   jsonOutput?: boolean;
+  /** Set to false by `--no-upload` to check files against the server without uploading them. */
+  upload?: boolean;
 }
 
 class UploadFile extends File {
@@ -328,7 +330,12 @@ export const checkForDuplicates = async (files: string[], { concurrency, skipHas
 };
 
 export const uploadFiles = async (files: string[], options: UploadOptionsDto): Promise<Asset[]> => {
-  const { dryRun, concurrency, progress } = options;
+  const { dryRun, concurrency, progress, upload } = options;
+  if (upload === false) {
+    console.log(`Not uploading ${files.length} new asset${s(files.length)}, they have been left in place`);
+    return [];
+  }
+
   if (files.length === 0) {
     console.log('All assets were already uploaded, nothing to do.');
     return [];
