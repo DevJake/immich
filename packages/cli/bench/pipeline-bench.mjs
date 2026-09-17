@@ -77,10 +77,13 @@ const resetStub = async () => {
   await fetch(`${BASE_URL}/__reset`);
 };
 
-const scenarios = [
+// Effective uplink capacity, in bytes per second, for the throttled scenarios.
+const MBIT = 1_000_000 / 8;
+
+// The original set: no uplink limit, so "uploading" costs whatever loopback costs. Retained
+// because it is the regime a local or LAN instance actually presents.
+const loopbackScenarios = [
   {
-    // Six bulk-upload-check batches, and an upload cost that is almost all server-side wait, so
-    // the client really is idle while it waits. This is the shape the change is meant to help.
     name: 'mostly-new, 30000 x 8 KiB, upload 8 ms, concurrency 32',
     files: 30_000,
     sizeBytes: 8 * 1024,
@@ -90,7 +93,6 @@ const scenarios = [
     concurrency: 32,
   },
   {
-    // One full batch plus a tail: only a sixth of the hashing has anywhere to overlap into.
     name: 'mostly-new, 6000 x 64 KiB, upload 8 ms, concurrency 8',
     files: 6000,
     sizeBytes: 64 * 1024,
@@ -100,8 +102,6 @@ const scenarios = [
     concurrency: 8,
   },
   {
-    // Fewer files than one batch, hashed faster than the idle interval: nothing can flush early,
-    // so no overlap is possible at all. Kept to show that case honestly.
     name: 'mostly-new, 800 x 1 MiB, upload 30 ms, concurrency 4',
     files: 800,
     sizeBytes: 1024 * 1024,
@@ -130,6 +130,82 @@ const scenarios = [
   },
 ];
 
+// The constrained-uplink set. Every scenario uses 30,000 files so that five of the six check
+// batches have somewhere to overlap into, and the file size is chosen per bandwidth to keep the
+// upload phase near half a minute — otherwise 5 Mbit/s of real photographs would run for days.
+// Holding the upload window roughly constant is the most favourable framing available to the
+// change: hashing cost is near enough fixed across the three, so if overlap cannot pay here it
+// cannot pay at any of these speeds.
+const throttledScenarios = [
+  {
+    name: 'mostly-new, 30000 x 9 KiB, 100 Mbit/s uplink, concurrency 8',
+    files: 30_000,
+    sizeBytes: 9 * 1024,
+    uploadDelayMs: 5,
+    checkDelayMs: 50,
+    duplicateRatio: 0,
+    concurrency: 8,
+    uplinkBps: 100 * MBIT,
+  },
+  {
+    name: 'mostly-new, 30000 x 1400 B, 20 Mbit/s uplink, concurrency 8',
+    files: 30_000,
+    sizeBytes: 1400,
+    uploadDelayMs: 5,
+    checkDelayMs: 50,
+    duplicateRatio: 0,
+    concurrency: 8,
+    uplinkBps: 20 * MBIT,
+  },
+  {
+    name: 'mostly-new, 30000 x 64 B, 5 Mbit/s uplink, concurrency 8',
+    files: 30_000,
+    sizeBytes: 64,
+    uploadDelayMs: 5,
+    checkDelayMs: 50,
+    duplicateRatio: 0,
+    concurrency: 8,
+    uplinkBps: 5 * MBIT,
+  },
+  {
+    name: 'mostly-duplicates (90%), 30000 x 9 KiB, 100 Mbit/s uplink, concurrency 8',
+    files: 30_000,
+    sizeBytes: 9 * 1024,
+    uploadDelayMs: 5,
+    checkDelayMs: 50,
+    duplicateRatio: 0.9,
+    concurrency: 8,
+    uplinkBps: 100 * MBIT,
+  },
+  {
+    name: 'mostly-duplicates (90%), 30000 x 1400 B, 20 Mbit/s uplink, concurrency 8',
+    files: 30_000,
+    sizeBytes: 1400,
+    uploadDelayMs: 5,
+    checkDelayMs: 50,
+    duplicateRatio: 0.9,
+    concurrency: 8,
+    uplinkBps: 20 * MBIT,
+  },
+  {
+    name: 'mostly-duplicates (90%), 30000 x 64 B, 5 Mbit/s uplink, concurrency 8',
+    files: 30_000,
+    sizeBytes: 64,
+    uploadDelayMs: 5,
+    checkDelayMs: 50,
+    duplicateRatio: 0.9,
+    concurrency: 8,
+    uplinkBps: 5 * MBIT,
+  },
+];
+
+const scenarioSets = { loopback: loopbackScenarios, throttled: throttledScenarios };
+const scenarios = scenarioSets[process.env.SCENARIO_SET ?? 'loopback'];
+if (!scenarios) {
+  console.error(`unknown SCENARIO_SET, expected one of: ${Object.keys(scenarioSets).join(', ')}`);
+  process.exit(1);
+}
+
 const startStub = (scenario) =>
   new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [path.join(import.meta.dirname, 'stub-server.mjs')], {
@@ -139,6 +215,7 @@ const startStub = (scenario) =>
         STUB_UPLOAD_DELAY_MS: String(scenario.uploadDelayMs),
         STUB_CHECK_DELAY_MS: String(scenario.checkDelayMs),
         STUB_DUPLICATE_RATIO: String(scenario.duplicateRatio),
+        STUB_UPLINK_BPS: String(scenario.uplinkBps ?? 0),
       },
       stdio: ['ignore', 'pipe', 'inherit'],
     });
@@ -191,6 +268,7 @@ for (const scenario of scenarios) {
             batches: stats.checkBatchSizes,
             firstUploadAt: stats.firstUploadAt,
             uploads: stats.uploads,
+            uplinkBytes: stats.uplinkBytes,
           });
         } finally {
           rmSync(cacheHome, { recursive: true, force: true });
