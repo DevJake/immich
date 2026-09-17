@@ -22,6 +22,7 @@ import {
   getAlbumName,
   startWatch,
   upload,
+  Uploader,
   uploadFiles,
   UploadOptionsDto,
 } from 'src/commands/asset';
@@ -627,6 +628,299 @@ describe('deleteFiles', () => {
 
     expect(fs.existsSync(testFilePath)).toBe(true);
     expect(fs.existsSync(sidecarPath)).toBe(true);
+  });
+});
+
+describe('pipelined upload', () => {
+  const baseUrl = 'https://example.com';
+  const fetchMocker = createFetchMock(vi);
+
+  let testDir: string;
+  let files: string[];
+  let logSpy: MockInstance<typeof console.log>;
+
+  const makeFiles = (count: number) =>
+    Array.from({ length: count }, (_, index) => {
+      const filepath = path.join(testDir, `file-${index}.jpg`);
+      fs.writeFileSync(filepath, `contents ${index}`);
+      return filepath;
+    });
+
+  const batchSizes = () =>
+    vi.mocked(checkBulkUpload).mock.calls.map((call) => call[0].assetBulkUploadCheckDto.assets.length);
+
+  beforeEach(() => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'test-pipeline-'));
+    files = makeFiles(10);
+
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    vi.mocked(defaults).baseUrl = baseUrl;
+    vi.mocked(defaults).headers = { 'x-api-key': 'key' };
+    vi.mocked(getSupportedMediaTypes).mockResolvedValue({ image: ['.jpg'], sidecar: ['.xmp'], video: ['.mp4'] });
+
+    // Accept everything the server is asked about. Reset first: the module mock is shared with
+    // every other suite in this file, so its call history would otherwise still be there.
+    vi.mocked(checkBulkUpload).mockReset();
+    vi.mocked(checkBulkUpload).mockImplementation(async ({ assetBulkUploadCheckDto }) => ({
+      results: assetBulkUploadCheckDto.assets.map(({ id }) => ({ action: AssetUploadAction.Accept, id })),
+    }));
+
+    fetchMocker.enableMocks();
+    fetchMocker.resetMocks();
+    fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), () => ({
+      status: 201,
+      body: JSON.stringify({ id: 'fc5621b1-86f6-44a1-9905-403e607df9f5', status: 'created' }),
+    }));
+  });
+
+  afterEach(() => {
+    logSpy.mockRestore();
+    fetchMocker.disableMocks();
+    fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  describe('bulk-upload-check batching policy', () => {
+    it('sends full batches under a fast producer, and only the tail is short', async () => {
+      await checkForDuplicates(files, { concurrency: 4 }, { batchSize: 4, idleMs: 1000, onAccepted: async () => {} });
+
+      // 10 files, batches of 4: two full requests plus the tail. The idle timer never fires,
+      // because the producer never leaves the batcher idle for a whole second.
+      expect(batchSizes()).toEqual([4, 4, 2]);
+    });
+
+    it('does not arm the idle flush when nobody is consuming the results', async () => {
+      await checkForDuplicates(files, { concurrency: 4 });
+
+      // Unchanged from the pre-pipeline behaviour: one request for everything under 5,000 files.
+      expect(batchSizes()).toEqual([10]);
+    });
+
+    it('flushes a partial batch when the producer goes idle', async () => {
+      // 60 ms per file against a 20 ms idle window, so every file is its own batch. This is the
+      // case the size-only policy handled worst: large files would otherwise leave the network
+      // idle until 5,000 of them had been hashed.
+      await checkForDuplicates(
+        files.slice(0, 4),
+        { concurrency: 1 },
+        { batchSize: 5000, idleMs: 20, onAccepted: async () => {}, onBeforeHash: () => sleep(60) },
+      );
+
+      expect(batchSizes()).toEqual([1, 1, 1, 1]);
+    });
+
+    it('issues a single check request for a small directory', async () => {
+      await upload([testDir], {} as BaseOptions, { concurrency: 4 });
+
+      expect(batchSizes()).toEqual([10]);
+      expect(fetchMocker.mock.calls.length).toBe(10);
+    });
+  });
+
+  describe('overlap', () => {
+    it('uploads accepted files while later files are still being hashed', async () => {
+      const events: string[] = [];
+      const uploader = new Uploader({ concurrency: 1 });
+
+      fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), () => {
+        events.push('upload');
+        return { status: 201, body: JSON.stringify({ id: 'asset-id', status: 'created' }) };
+      });
+
+      await checkForDuplicates(
+        files,
+        { concurrency: 1 },
+        {
+          batchSize: 2,
+          idleMs: 1000,
+          onAccepted: (filepaths) => uploader.add(filepaths),
+          onBeforeHash: async () => {
+            events.push('hash');
+            await uploader.waitForCapacity();
+          },
+        },
+      );
+      await uploader.drain();
+
+      expect(events.filter((event) => event === 'upload')).toHaveLength(10);
+      // The point of the change: an upload went out before the last file was read off disk.
+      expect(events.indexOf('upload')).toBeLessThan(events.lastIndexOf('hash'));
+    });
+  });
+
+  describe('backpressure', () => {
+    it('stops handing over files once the upload queue is saturated', async () => {
+      const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+
+      fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), async () => {
+        await gate;
+        return { status: 201, body: JSON.stringify({ id: 'asset-id', status: 'created' }) };
+      });
+
+      const uploader = new Uploader({ concurrency: 1 });
+      const added = uploader.add(makeFiles(40));
+
+      // concurrency 1 x UPLOAD_BACKLOG_FACTOR 4. Without a bound all 40 would be queued at once.
+      await vi.waitFor(() => expect(uploader.pendingCount).toBe(4));
+      await sleep(50);
+      expect(uploader.pendingCount).toBe(4);
+      expect(uploader.saturated).toBe(true);
+
+      release();
+      await added;
+      await uploader.drain();
+
+      expect(uploader.pendingCount).toBe(0);
+      expect(uploader.report()).toHaveLength(40);
+    });
+
+    it('wakes every waiter when a slot frees, so the hand-off is not starved behind hashing', async () => {
+      // Hashing and the hand-off both park on waitForCapacity, and hashing does not consume a slot
+      // when it wakes. Waking one waiter per freed slot let the hashers take every wakeup in turn
+      // and left the upload queue idle with room to spare.
+      let isOpen = false;
+      const held: Array<() => void> = [];
+
+      fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), async () => {
+        if (!isOpen) {
+          const { promise, resolve } = Promise.withResolvers<void>();
+          held.push(resolve);
+          await promise;
+        }
+        return { status: 201, body: JSON.stringify({ id: 'asset-id', status: 'created' }) };
+      });
+
+      const uploader = new Uploader({ concurrency: 2 });
+      const added = uploader.add(makeFiles(30));
+
+      // concurrency 2 x UPLOAD_BACKLOG_FACTOR 4.
+      await vi.waitFor(() => expect(uploader.pendingCount).toBe(8));
+
+      // Stand in for the hashing workers parked on the same gate.
+      let woken = 0;
+      for (let index = 0; index < 4; index++) {
+        void uploader.waitForCapacity().then(() => {
+          woken += 1;
+        });
+      }
+      await sleep(20);
+      expect(woken).toBe(0);
+
+      // Exactly one upload completes.
+      await vi.waitFor(() => expect(held.length).toBeGreaterThan(0));
+      held.shift()?.();
+
+      await vi.waitFor(() => expect(woken).toBe(4));
+      // ...and the hand-off, not just the hashers, got the freed slot back.
+      await vi.waitFor(() => expect(uploader.pendingCount).toBe(8));
+
+      isOpen = true;
+      const stillHeld = [...held];
+      held.length = 0;
+      for (const resolve of stillHeld) {
+        resolve();
+      }
+      await added;
+      await uploader.drain();
+
+      expect(uploader.report()).toHaveLength(30);
+    });
+
+    it('holds hashing back while the consumer is saturated', async () => {
+      const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+
+      const checking = checkForDuplicates(files, { concurrency: 4 }, { batchSize: 1, onBeforeHash: () => gate });
+
+      await sleep(50);
+      expect(checkBulkUpload).not.toHaveBeenCalled();
+
+      release();
+      const { newFiles, duplicates, rejects } = await checking;
+      expect(newFiles.toSorted()).toEqual(files.toSorted());
+      expect({ duplicates, rejects }).toEqual({ duplicates: [], rejects: [] });
+    });
+  });
+
+  describe('failures and final phases', () => {
+    it('does not report a file whose upload exhausted its retries as uploaded', async () => {
+      // Concurrency 1, so the first three attempts are the three retries of the first file.
+      let attempts = 0;
+      fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), () => {
+        attempts += 1;
+        if (attempts <= 3) {
+          throw new Error('Network error');
+        }
+        return { status: 201, body: JSON.stringify({ id: 'asset-id', status: 'created' }) };
+      });
+
+      await upload([testDir], {} as BaseOptions, { concurrency: 1, delete: true });
+
+      // The server never took it, so --delete must leave the only copy alone.
+      expect(fs.existsSync(files[0])).toBe(true);
+      for (const filepath of files.slice(1)) {
+        expect(fs.existsSync(filepath)).toBe(false);
+      }
+    });
+
+    it('deletes nothing until every upload has finished', async () => {
+      fetchMocker.doMockIf(new RegExp(`${baseUrl}/assets$`), () => {
+        // Deletion stays a final phase: nothing may be unlinked while uploads are in flight.
+        expect(files.filter((filepath) => fs.existsSync(filepath))).toHaveLength(files.length);
+        return { status: 201, body: JSON.stringify({ id: 'asset-id', status: 'created' }) };
+      });
+
+      await upload([testDir], {} as BaseOptions, { concurrency: 2, delete: true });
+
+      expect(files.filter((filepath) => fs.existsSync(filepath))).toHaveLength(0);
+    });
+
+    it('surfaces a mid-pipeline error without leaving a queue undrained', async () => {
+      vi.mocked(checkBulkUpload).mockImplementation(async () => {
+        throw new Error('server exploded');
+      });
+
+      await expect(upload([testDir], {} as BaseOptions, { concurrency: 2 })).resolves.toBeUndefined();
+
+      // Every check retry failed, so nothing was accepted and nothing was uploaded.
+      expect(fetchMocker.mock.calls.length).toBe(0);
+      for (const filepath of files) {
+        expect(fs.existsSync(filepath)).toBe(true);
+      }
+    });
+  });
+
+  describe('options that must not regress', () => {
+    it('leaves new files in place with --no-upload', async () => {
+      await upload([testDir], {} as BaseOptions, { concurrency: 2, upload: false });
+
+      expect(fetchMocker.mock.calls.length).toBe(0);
+      for (const filepath of files) {
+        expect(fs.existsSync(filepath)).toBe(true);
+      }
+      expect(logSpy.mock.calls.flat().join('\n')).toContain('Not uploading 10 new assets');
+    });
+
+    it('uploads nothing with --dry-run', async () => {
+      await upload([testDir], {} as BaseOptions, { concurrency: 2, dryRun: true, delete: true });
+
+      expect(fetchMocker.mock.calls.length).toBe(0);
+      for (const filepath of files) {
+        expect(fs.existsSync(filepath)).toBe(true);
+      }
+      expect(logSpy.mock.calls.flat().join('\n')).toContain('Would have uploaded 10 assets');
+    });
+
+    it('emits the full json output shape', async () => {
+      await upload([testDir], {} as BaseOptions, { concurrency: 2, jsonOutput: true });
+
+      const payload = logSpy.mock.calls.map((call) => String(call[0])).find((line) => line.trimStart().startsWith('{'));
+      expect(payload).toBeDefined();
+
+      const parsed = JSON.parse(payload as string);
+      expect(Object.keys(parsed).toSorted()).toEqual(['duplicates', 'newAssets', 'newFiles', 'rejects']);
+      expect(parsed.newFiles).toHaveLength(10);
+      expect(parsed.newAssets).toHaveLength(10);
+    });
   });
 });
 
